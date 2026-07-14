@@ -1,0 +1,2475 @@
+// ────────────────────────────────────────────────────────────────────────────
+// Crown Island — Prisma schema.
+// Database: PostgreSQL.
+//
+// `Json` fields map to native `jsonb`. Case-insensitive search is now opt-in via
+// `mode: 'insensitive'` on the relevant `contains` filters (Postgres `LIKE` is
+// case-sensitive, unlike SQLite). `directUrl` is used by Prisma Migrate / CLI so
+// that schema changes run over a *direct* (non-pooled) connection while the app
+// itself can talk to a connection pooler (PgBouncer / Neon / Supabase) via
+// `DATABASE_URL`.
+// ────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = []
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ───── Enums ─────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  CUSTOMER
+  TESTER
+  STAFF
+  /// Reception staff ladder (rises in manual-discount authority). Each role's
+  /// max discount % is configured in the admin panel (see RoleDiscountLimit).
+  SUPERVISOR
+  MANAGER
+  DIRECTOR
+  SECURITY
+  /// Housekeeping staff — confined to the staff operations desk (`/gate/ops`):
+  /// cleaning / inspection / restock tickets. Never reception, never money.
+  HOUSEKEEPING
+  /// Maintenance staff — confined to the staff operations desk (`/gate/ops`):
+  /// repair / out-of-service tickets, may return a fixed place to service.
+  MAINTENANCE
+  ADMIN
+  SUPER_ADMIN
+  DEVELOPER
+  /// Restaurant partner — a customer-like account that owns exactly one
+  /// Restaurant profile and manages it from the guest app (`/menu/manage`).
+  /// Not staff: no gate, no admin panel, signs in through the customer paths.
+  RESTAURANT
+}
+
+// NOTE: `Account.provider` is a free-form String, NOT a custom enum.
+//
+// `@auth/prisma-adapter` always passes the provider id as the literal string
+// from the Auth.js provider config (`'google'`, `'facebook'`, `'apple'`,
+// `'customer-password'`, …). Constraining the column to a custom enum like
+// `AuthProvider { GOOGLE, FACEBOOK, ... }` broke OAuth sign-in because Prisma
+// rejected the lowercase `'google'` value the adapter sent on its way to the
+// `getUserByAccount()` lookup. The previous `AuthProvider` enum was removed
+// and the field is now plain String — same SQLite TEXT under the hood,
+// validation happens upstream in our `buildProviders()` allow-list instead
+// (plain `text` column under the hood).
+
+enum ServiceKind {
+  DAY_USE
+  CABANA
+  EVENT
+  OTHER
+}
+
+/// Distinguishes the original "beach" / normal categories from the separately
+/// managed "activities" categories. Existing rows default to NORMAL.
+enum CategoryType {
+  NORMAL
+  ACTIVITY
+}
+
+enum BookingStatus {
+  PENDING_PAYMENT
+  CONFIRMED
+  CANCELLED
+  EXPIRED
+  FAILED
+}
+
+/// How a service handles guests beyond the per-unit included capacity.
+///   NEW_UNIT     — extra people roll into additional booking units (e.g. 6
+///                  people in a 4-person cabana ⇒ 2 cabanas).
+///   EXTRA_CHARGE — stay in one unit (up to the hard `maxPersonsPerUnit`) and
+///                  charge `extraPersonPriceCents` for each person beyond the
+///                  included allowance.
+enum ExtraPersonMode {
+  NEW_UNIT
+  EXTRA_CHARGE
+}
+
+/// Physical place kind a service's units map to. Drives the reception/gate
+/// place-assignment UI labels (cinema-style seat picker).
+enum PlaceType {
+  CABIN
+  CABANA
+  UMBRELLA
+  SEAT
+  SPOT
+}
+
+/// Lifecycle of a booking's physical place assignment, used to gate check-in.
+///   NOT_REQUIRED — the service does not require place assignment.
+///   PENDING      — assignment required, none of the units placed yet.
+///   PARTIAL      — some (but not all) units have a place.
+///   COMPLETE     — every unit has a place; check-in is allowed.
+enum PlacementStatus {
+  NOT_REQUIRED
+  PENDING
+  PARTIAL
+  COMPLETE
+}
+
+/// Provisioning state of a booking's ZKBio CVSecurity physical-access credential
+/// (card + door access level), for services flagged `requiresAccessControl`.
+///   NONE        — not a ZK booking, or ZK integration disabled (the default).
+///   PENDING     — confirmed ZK booking awaiting/​retrying provisioning (ZK down,
+///                 card pool empty, or a transient error). The reconciler retries.
+///   PROVISIONED — the ZK person exists with an active card + day window; the
+///                 door binding follows the assigned place(s).
+///   FAILED      — a non-transient error (e.g. misconfigured access level). Needs
+///                 admin attention; surfaced on the booking with `zkLastError`.
+///   REVOKED     — access torn down (cancel/refund/expiry): person deleted, card
+///                 released back to the pool.
+enum ZkProvisionStatus {
+  NONE
+  PENDING
+  PROVISIONED
+  FAILED
+  REVOKED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  /// A gateway refund is being placed for this payment: the row is claimed
+  /// (SUCCEEDED → REFUND_PENDING) BEFORE the external refund call, so a
+  /// concurrent/duplicate admin refund can never double-charge the gateway.
+  /// Finalises to REFUNDED, or rolls back to SUCCEEDED if the refund call fails.
+  REFUND_PENDING
+  REFUNDED
+}
+
+/// Verification state of a guest's uploaded identity document.
+///   PENDING  — uploaded, not yet reviewed (default; satisfies the check-in gate).
+///   VERIFIED — a staff/admin user confirmed the ID matches the guest.
+///   REJECTED — the document was unreadable or invalid and must be re-uploaded.
+enum IdVerificationStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum PaymentProvider {
+  /// Crédit Agricole Egypt card acquiring via Mastercard Payment Gateway
+  /// Services (MPGS) Hosted Checkout — the only card gateway.
+  CREDIT_AGRICOLE
+  INSTAPAY
+  VODAFONE_CASH
+  APPLE_PAY
+  /// Reception/offline booking paid in cash — recorded only, never processed.
+  CASH
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PAID
+  FAILED
+  CANCELLED
+}
+
+/// Which financial pool a RefundLine belongs to. RefundLine stays the ONE
+/// append-only money-out ledger; `kind` keeps the pools disjoint so booking
+/// (service) refund netting and insurance-deposit refund netting never
+/// double-count each other. Historical rows default to SERVICE.
+enum RefundKind {
+  SERVICE
+  INSURANCE
+}
+
+/// How a service's insurance deposit is calculated (see docs/INSURANCE.md).
+enum InsuranceChargeType {
+  /// `insurancePercent` % of the eligible service total BEFORE discounts.
+  PERCENT
+  /// Flat `insuranceFixedCents` per booking.
+  FIXED
+}
+
+/// Collection lifecycle of a booking's insurance deposit.
+///   PENDING   — charged on the invoice, awaiting payment capture (online).
+///   COLLECTED — real money received (provider capture confirmed, or the
+///               reception CASH/INSTAPAY commit). Discounts/vouchers NEVER
+///               produce COLLECTED — only actual payment does.
+///   VOIDED    — the booking terminalized without the deposit ever being
+///               collected (failed/expired/cancelled unpaid, or the capture
+///               was auto-refunded before confirmation).
+enum InsuranceCollectionStatus {
+  PENDING
+  COLLECTED
+  VOIDED
+}
+
+/// Reception checkout decision for a collected deposit.
+enum InsuranceDecision {
+  UNDECIDED
+  REFUND
+  NO_REFUND
+}
+
+/// Delivery channel of an insurance refund. PROVIDER = back to the original
+/// card via the MPGS gateway (admin-approved); CASH / INSTAPAY = desk payout
+/// for reception-paid bookings only. Cross-method is rejected server-side.
+enum InsuranceRefundMethod {
+  PROVIDER
+  CASH
+  INSTAPAY
+}
+
+/// Workflow state of one insurance-refund attempt (append-only rows; a
+/// rejected/failed attempt is never overwritten — corrections append).
+enum InsuranceRefundStatus {
+  /// PROVIDER refunds awaiting admin approval in /admin/insurance-refunds.
+  AWAITING_ADMIN
+  /// Desk (CASH/INSTAPAY) payout awaiting execution at reception.
+  PENDING_DESK
+  /// Claimed by an admin; the gateway call is in flight (or crashed mid-way —
+  /// the insurance sweep resolves stuck rows by gateway leg evidence).
+  PROCESSING
+  COMPLETED
+  FAILED
+  REJECTED
+  /// Gateway evidence is ambiguous or an invariant broke — needs a human.
+  MANUAL_ATTENTION
+}
+
+enum PriceRuleKind {
+  PER_PERSON
+  PER_CAR
+  FLAT
+  WEEKEND_SURCHARGE
+  DATE_OVERRIDE
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  STATUS_CHANGE
+  PRICE_CHANGE
+  REFUND
+  LOGIN
+  ROLE_CHANGE
+  /// Read access to a sensitive record (e.g. an admin opening a customer profile).
+  VIEW
+}
+
+enum GateScanResult {
+  ADMITTED
+  /// A guest party scanned out at the exit gate (departure).
+  EXITED
+  DENIED
+  /// A reception-desk (offline) booking + payment recorded by a STAFF operator.
+  /// Lives in the gate-activity trail alongside admits/denies so a staff
+  /// member's reception work shows up in their history.
+  RECEPTION
+}
+
+// ───── Users & auth ──────────────────────────────────────────────────────────
+
+model User {
+  id                     String    @id @default(cuid())
+  email                  String?   @unique
+  emailVerified          DateTime?
+  phone                  String?   @unique
+  phoneVerified          DateTime?
+  name                   String?
+  /// Bcrypt hash of the user's password, when email/password sign-in is enabled
+  /// for this account. NULL = OAuth- or phone-OTP-only account.
+  passwordHash           String?
+  /// Session epoch. Bumped on every password reset / change so that any JWT
+  /// minted before the change fails re-hydration and the stale session is
+  /// evicted (stateless-JWT session invalidation). Tokens issued before this
+  /// column existed carry no version and are grandfathered until natural expiry.
+  tokenVersion           Int       @default(0)
+  /// Keyed HMAC of a staff member's desk override PIN (deterministic so a bare
+  /// PIN can identify the authorizer; unique so two staff can't share one).
+  /// Used only to authorize manual reception discounts. NULL = no PIN set.
+  pinHash                String?   @unique
+  image                  String?
+  role                   UserRole  @default(CUSTOMER)
+  /// Timestamp of when the user most recently accepted the global Terms & Conditions.
+  /// Used to force a re-accept if the terms are updated.
+  termsAcceptedAt        DateTime?
+  /// Timestamp of when the user most recently accepted the global Refund Policy.
+  /// Compared against Settings.refundPolicyUpdatedAt to force a re-accept when the
+  /// policy is edited — same mechanism as termsAcceptedAt.
+  refundPolicyAcceptedAt DateTime?
+  /// Soft-delete tombstone. When set, the account is archived: it can no longer
+  /// authenticate and is excluded from active listings, but its bookings,
+  /// payments and audit history are preserved (a hard delete would CASCADE them
+  /// away). NULL = active account.
+  deletedAt              DateTime?
+  /// Ban tombstone. When set, the account is BLOCKED: it cannot authenticate,
+  /// and its identifiers (email/phone/national-id/passport) are added to
+  /// BlockedIdentity so the person cannot register again. NULL = not blocked.
+  blockedAt              DateTime?
+  blockedReason          String?
+  blockedById            String?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  accounts                 Account[]
+  sessions                 Session[]
+  profile                  CustomerProfile?
+  bookings                 Booking[]
+  auditLogs                AuditLog[]                      @relation("AuditActor")
+  passwordResetTokens      PasswordResetToken[]
+  /// Gate scans this user performed as an operator (STAFF / SECURITY / admin).
+  gateScansHandled         GateScanEvent[]                 @relation("GateOperator")
+  /// Gate scans where this user was the scanned guest.
+  gateScansAsGuest         GateScanEvent[]                 @relation("GateScannedUser")
+  /// Work sessions (shifts) auto-opened when this staff member acts at the gate
+  /// or reception desk — backs the staff working-hours report.
+  workSessions             WorkSession[]                   @relation("WorkSessionStaff")
+  /// CRM tags assigned to this customer (admin-curated library).
+  tagAssignments           CustomerTagAssignment[]
+  /// Housekeeping & maintenance tickets this user reported / works on.
+  opsTicketsCreated        OpsTicket[]                     @relation("OpsTicketCreator")
+  opsTicketsAssigned       OpsTicket[]                     @relation("OpsTicketAssignee")
+  opsTicketEvents          OpsTicketEvent[]                @relation("OpsEventActor")
+  staffNotifications       StaffNotification[]
+  /// Daily visit groups where this user is the customer (online bookings).
+  visitCodes               VisitCode[]
+  /// Restaurant profile owned by this account (RESTAURANT role only).
+  restaurant               Restaurant?
+  /// Financial penalties placed on this customer by admins.
+  sanctions                Sanction[]                      @relation("SanctionUser")
+  /// Per-category terms-gate acceptances by this customer.
+  categoryTermsAcceptances CategoryTermsAcceptance[]
+  /// Web push subscriptions — one row per browser/device that opted in.
+  pushSubscriptions        PushSubscription[]
+  /// In-app notification inbox rows for this customer (bell + /notifications).
+  customerNotifications    CustomerNotification[]
+  /// Broadcast notification campaigns this admin authored.
+  notifCampaigns           NotificationCampaign[]          @relation("NotifCampaignCreator")
+  /// SPECIFIC-audience campaign picks that target this customer.
+  notifCampaignPicks       NotificationCampaignRecipient[]
+  /// Post-visit guest reviews this customer submitted.
+  reviewsGiven             Review[]                        @relation("ReviewsGiven")
+  /// In-app cancellation requests this customer submitted for paid bookings.
+  cancellationRequests     CancellationRequest[]           @relation("CancellationRequestsMade")
+
+  @@index([role])
+  @@index([deletedAt])
+  @@index([blockedAt])
+  @@index([updatedAt])
+}
+
+enum BlockedIdentityKind {
+  EMAIL
+  PHONE
+  NATIONAL_ID
+  PASSPORT
+}
+
+/**
+ * Blocklist of identifiers banned from the application. When an admin blocks a
+ * user, that user's email / phone / national-id / passport are written here so
+ * the same person cannot register again under a new account. Checked at every
+ * registration + identity-changing entry point. `value` is the normalised
+ * identifier (lower-cased email, trimmed id, etc.).
+ */
+model BlockedIdentity {
+  id          String              @id @default(cuid())
+  kind        BlockedIdentityKind
+  value       String
+  /// The user this identifier was captured from (for unblock + provenance).
+  userId      String?
+  reason      String?
+  blockedById String?
+  createdAt   DateTime            @default(now())
+
+  @@unique([kind, value])
+  @@index([userId])
+  /// Sync pull window scan (changes-core: createdAt in (since, now]).
+  @@index([createdAt])
+}
+
+// ───── User sanctions (financial penalties) ──────────────────────────────────
+
+/// Lifecycle of a financial sanction.
+///   ACTIVE    — unpaid; automatically added to the user's next booking total.
+///   PAID      — settled (through a booking's payment, or marked paid by an admin).
+///   WAIVED    — forgiven by an admin; never charged.
+///   CANCELLED — issued in error / withdrawn; never charged.
+/// PAID / WAIVED / CANCELLED are terminal — corrections create a NEW sanction.
+enum SanctionStatus {
+  ACTIVE
+  PAID
+  WAIVED
+  CANCELLED
+}
+
+/**
+ * A financial penalty an admin places on a customer who caused problems
+ * (damage, misconduct, unpaid extras, …). Reception sees ACTIVE sanctions when
+ * serving the customer, and every new booking the customer makes carries all
+ * ACTIVE sanctions on top of the booking price until they are settled.
+ * Settlement paths:
+ * - ONLINE BOOKING: `createBooking` reserves the sanction (`pendingBookingId`),
+ * adds it as an invoice line; the payment webhook flips it to PAID
+ * (`paidByBookingId`). Failure / cancellation releases the reservation.
+ * - RECEPTION BOOKING: matched by guest phone → settled immediately (desk
+ * bookings are paid on the spot).
+ * - ADMIN: marked PAID (paid another way) / WAIVED / CANCELLED from the panel.
+ * A full booking refund REACTIVATES the sanctions that booking had paid.
+ * `reason` is customer-facing; `notes` is admin-only. Race-safety lives in
+ * `src/server/services/sanctions.ts` (conditional updateMany + count checks).
+ */
+model Sanction {
+  id               String         @id @default(cuid())
+  userId           String
+  /// Penalty amount in minor units (piastres). Always > 0.
+  amountCents      Int
+  /// Customer-facing justification — shown to reception and on the booking breakdown.
+  reason           String
+  /// Internal admin-only notes — never shown to the customer or reception.
+  notes            String?
+  status           SanctionStatus @default(ACTIVE)
+  /// Admin who issued the sanction (plain scalar audit FK, like checkedInById).
+  createdById      String
+  /// PENDING_PAYMENT online booking currently carrying this sanction on its
+  /// invoice. Cleared on payment failure / cancellation; becomes
+  /// `paidByBookingId` on success. While the lock is live the sanction can't be
+  /// claimed by another booking or settled by hand (see isPendingLockLive).
+  pendingBookingId String?
+  /// Booking whose successful payment settled this sanction.
+  paidByBookingId  String?
+  /// Who settled it (admin for manual paid/waive/cancel, staff for desk bookings).
+  settledById      String?
+  settledAt        DateTime?
+  settlementNote   String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  user           User     @relation("SanctionUser", fields: [userId], references: [id], onDelete: Cascade)
+  pendingBooking Booking? @relation("SanctionPendingBooking", fields: [pendingBookingId], references: [id], onDelete: SetNull)
+  paidByBooking  Booking? @relation("SanctionPaidBooking", fields: [paidByBookingId], references: [id], onDelete: SetNull)
+
+  @@index([userId, status])
+  @@index([status, createdAt])
+  @@index([pendingBookingId])
+  @@index([paidByBookingId])
+  @@index([updatedAt])
+}
+
+/// NextAuth-compatible Account record for OAuth providers.
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  /// Auth.js provider id — e.g. "google", "facebook", "apple",
+  /// "customer-password", "admin-password". See the note next to ServiceKind
+  /// for why this is a String, not a custom enum.
+  provider          String
+  providerAccountId String
+  type              String // oauth | oidc | email | credentials
+  access_token      String?
+  refresh_token     String?
+  expires_at        Int?
+  id_token          String?
+  scope             String?
+  token_type        String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+/// Single-use magic link issued when a visitor enters their email at sign-up.
+/// Clicking the link proves they own the inbox. Tokens auto-expire after 30
+/// minutes. We store the requesting IP for audit + abuse correlation.
+model EmailVerificationToken {
+  id        String    @id @default(cuid())
+  /// SHA-256 hash of the actual token — the raw token only lives in the email.
+  tokenHash String    @unique
+  /// Lower-cased email we're verifying.
+  email     String
+  expiresAt DateTime
+  /// Set once the link has been redeemed; null = still consumable.
+  usedAt    DateTime?
+  /// IP that triggered the send — for forensic correlation only, never shown.
+  ipAddress String?
+  createdAt DateTime  @default(now())
+
+  @@index([email])
+  @@index([expiresAt])
+}
+
+/// Single-use token sent when a user requests a password reset. Like
+/// `EmailVerificationToken` but bound to an existing user account.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
+  userId    String
+  email     String
+  expiresAt DateTime
+  usedAt    DateTime?
+  ipAddress String?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+/// Backoff state for resend-style endpoints (magic link, password reset).
+/// Keyed by a free-form string — typically `email:user@x.com` or `ip:1.2.3.4`.
+/// `attempts` increases each time we accept a request; `nextAllowedAt` is the
+/// earliest moment another attempt is permitted. Schedule (s): 0, 30, 60, 120,
+/// 300, 600, 1800, 3600, 21600, 43200, 86400 (cap = 1 day after 10 attempts).
+model AuthRateLimit {
+  key           String   @id
+  attempts      Int      @default(0)
+  nextAllowedAt DateTime
+  lastAttemptAt DateTime
+  updatedAt     DateTime @updatedAt
+
+  @@index([nextAllowedAt])
+}
+
+model CustomerProfile {
+  id                   String   @id @default(cuid())
+  userId               String   @unique
+  fullName             String
+  phone                String
+  countryCode          String   @default("EG")
+  age                  Int?
+  isHandicapped        Boolean  @default(false)
+  email                String?
+  /// Egyptian National ID (14 digits). Exactly one of `nationalId` / `passportId`
+  /// is required to complete the profile (see the post-sign-in completion flow).
+  nationalId           String?
+  /// Passport number — the alternative to `nationalId` for non-Egyptian guests.
+  passportId           String?
+  /// Required user region (Egyptian governorate, stored as its English name).
+  region               String?
+  /// Customer-facing notes (visible context about the guest).
+  notes                String?
+  /// Internal admin-only notes — never shown to the customer. Edited from the
+  /// admin Customer Profile and recorded in the audit log.
+  adminNotes           String?
+  /// Promotional / marketing opt-in (offers, news). Off by default.
+  marketingOpt         Boolean  @default(false)
+  /// Transactional booking updates (confirmations, changes, refunds). On by default.
+  notifyBookingUpdates Boolean  @default(true)
+  /// Visit reminders ahead of a booked day. On by default.
+  notifyReminders      Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([updatedAt])
+}
+
+// ───── Catalog ───────────────────────────────────────────────────────────────
+
+model Category {
+  id             String       @id @default(cuid())
+  slug           String       @unique
+  /// NORMAL = the original beach categories; ACTIVITY = activities categories,
+  /// managed in their own admin section and shown on a separate booking tab.
+  type           CategoryType @default(NORMAL)
+  /// Display name in English.
+  nameEn         String
+  /// Display name in Arabic.
+  nameAr         String
+  descEn         String?
+  descAr         String?
+  /// Long-form story for the "About this experience" page — supports a few
+  /// paragraphs of rich copy that paints the journey for the customer.
+  longDescEn     String?
+  longDescAr     String?
+  /// Public cover image URL (uploaded via admin → Media table).
+  coverUrl       String?
+  /// Optional category logo / brand mark — the LIGHT-mode variant. Shown when a
+  /// customer enters the category (booking page) on a light theme.
+  /// Uploaded via admin → Media table, same as coverUrl.
+  logoUrl        String?
+  /// DARK-mode variant of the logo. Shown when the UI is in the dark theme and
+  /// on the dark downloadable ticket. Falls back to `logoUrl` when not set.
+  logoDarkUrl    String?
+  /// `string[]` of additional image URLs shown in the gallery on the about
+  /// page. Stored as native `jsonb` to hold a variable-length list without a
+  /// join table.
+  galleryUrls    Json?
+  /// Optional hero video URL. Direct mp4/webm works, as does any YouTube /
+  /// Vimeo embed URL — the about page detects and renders the right element.
+  videoUrl       String?
+  /// JSON-encoded `string[]` of short bullet-style highlights ("Private cabana",
+  /// "Sunset access", etc). Independent EN / AR copies.
+  highlightsEn   Json?
+  highlightsAr   Json?
+  /// JSON-encoded `string[]` of Terms & Policy bullet points shown on the
+  /// about / detail screens (e.g. "Cancellation must be 24h before", "No
+  /// outside food"). Independent EN / AR copies, same shape as highlights.
+  /// These also drive the per-category terms gate: a signed-in customer must
+  /// accept them before the category's services unlock (see CategoryTermsAcceptance).
+  termsEn        Json?
+  termsAr        Json?
+  /// Timestamp of when the category's terms were last changed. Bumped by the
+  /// admin catalog mutation whenever termsEn/termsAr change so that previously
+  /// accepted customers are forced to re-accept the new version. `null` = the
+  /// terms have never been set/edited since this field was introduced.
+  termsUpdatedAt DateTime?
+  /// Geolocation for the on-map marker / route.
+  latitude       Float?
+  longitude      Float?
+  /// Free-form address string for display.
+  addressEn      String?
+  addressAr      String?
+  /// Optional minimum age (in years) a customer must be to enter/book this
+  /// category. `null` or `0` means no age restriction. When set, customers
+  /// whose recorded age is below this value are blocked from the category and
+  /// its services.
+  minAge         Int?
+  isActive       Boolean      @default(true)
+  sortOrder      Int          @default(0)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  services         Service[]
+  gateScans        GateScanEvent[]
+  /// Per-customer acceptances of this category's terms gate.
+  termsAcceptances CategoryTermsAcceptance[]
+
+  @@index([isActive, sortOrder])
+  @@index([updatedAt])
+}
+
+/**
+ * Record that a customer accepted a specific category's Terms & Conditions.
+ * One row per (user, category); `acceptedAt` is compared against the category's
+ * `termsUpdatedAt` to force a re-accept after the terms change. Rows cascade
+ * away with either the user or the category.
+ */
+model CategoryTermsAcceptance {
+  id         String   @id @default(cuid())
+  userId     String
+  categoryId String
+  acceptedAt DateTime @default(now())
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, categoryId])
+  @@index([categoryId])
+  /// Sync pull window scan (changes-core: acceptedAt in (since, now]).
+  @@index([acceptedAt])
+}
+
+model Service {
+  id                    String      @id @default(cuid())
+  categoryId            String
+  slug                  String
+  nameEn                String
+  nameAr                String
+  descEn                String?
+  descAr                String?
+  /// Long-form description for the service detail page.
+  longDescEn            String?
+  longDescAr            String?
+  /// JSON-encoded string[] for highlights.
+  highlightsEn          Json?
+  highlightsAr          Json?
+  /// JSON-encoded string[] for image gallery.
+  galleryUrls           Json?
+  kind                  ServiceKind @default(DAY_USE)
+  coverUrl              String?
+  /// Base price in minor units (piastres). Covers ONE booking unit and all of
+  /// its `includedPersonsPerUnit` included persons.
+  basePriceCents        Int         @default(0)
+  /// Price for each additional person beyond the included allowance, charged
+  /// only in `EXTRA_CHARGE` mode.
+  extraPersonPriceCents Int         @default(0)
+
+  // ── Per-unit people capacity & extra-people behaviour ──────────────────────
+  /// Persons covered by the base price within a single booking unit. Defaults
+  /// to 1 so legacy services keep their original per-person pricing until an
+  /// admin raises it (e.g. a 4-person cabana sets this to 4).
+  includedPersonsPerUnit Int             @default(1)
+  /// Hard physical cap of persons in one unit (used in EXTRA_CHARGE mode). When
+  /// null it falls back to `includedPersonsPerUnit` (i.e. no over-fill).
+  maxPersonsPerUnit      Int?
+  /// Master switch for the customer-facing "Extra Person" add-on counter. When
+  /// true, the booking page shows a separate Extra Person stepper (alongside
+  /// adults / children / cars) whose count is billed at `extraPersonPriceCents`
+  /// as a standalone line — it never opens additional units (umbrellas/cabanas)
+  /// nor counts toward the main booking capacity. Applies to the grouped-ticket
+  /// regimes (beach / cabana). Default false keeps existing services unchanged.
+  allowExtraPeople       Boolean         @default(false)
+  /// Behaviour for people beyond the included allowance. See enum.
+  extraPersonMode        ExtraPersonMode @default(NEW_UNIT)
+  /// Cap on the paid "Extra Person" add-on, PER UNIT (umbrella / cabana). The
+  /// whole-booking limit scales with the adults-driven unit count, e.g. 2 here
+  /// with a 2-umbrella party allows up to 4 extra persons. Null = no limit.
+  /// Only relevant when `allowExtraPeople` is true.
+  maxExtraPersonsPerUnit Int?
+
+  // ── Children ───────────────────────────────────────────────────────────────
+  /// Master switch for the children selector on the booking page.
+  allowChildren          Boolean @default(false)
+  /// Maximum age (years) that still counts as a child. Declared to customers.
+  maxChildAge            Int     @default(8)
+  /// Children carried free per booking unit (e.g. 2 children per cabana).
+  freeChildrenPerUnit    Int     @default(0)
+  /// Hard cap on the TOTAL number of children allowed on one booking (null =
+  /// no limit). Distinct from `maxChildAge` (an age threshold) — this bounds the
+  /// COUNT. Not applied to beach (DAY_USE), where children are always free and
+  /// unlimited. Enforced server-side in calcBooking.
+  maxChildrenPerBooking  Int?
+  /// Price for each child beyond the free allowance, in piastres.
+  extraChildPriceCents   Int     @default(0)
+  /// When true, children consume person capacity exactly like adults (and so
+  /// can trigger extra units / extra-person charges) instead of the dedicated
+  /// free/extra-child accounting above.
+  childrenCountAsPersons Boolean @default(false)
+
+  // ── Insurance deposit (docs/INSURANCE.md) ──────────────────────────────────
+  /// Master switch: bookings of this service collect a refundable insurance
+  /// deposit together with the payment. Config is SNAPSHOTTED onto each booking
+  /// (BookingInsurance) — later edits never change existing bookings.
+  insuranceEnabled    Boolean             @default(false)
+  insuranceType       InsuranceChargeType @default(FIXED)
+  /// Integer percent 1..100 of the pre-discount eligible service total.
+  /// Only meaningful when `insuranceType` is PERCENT.
+  insurancePercent    Int                 @default(0)
+  /// Flat deposit in piastres. Only meaningful when `insuranceType` is FIXED.
+  insuranceFixedCents Int                 @default(0)
+
+  // ── Multi-day ────────────────────────────────────────────────────────────--
+  /// When true the customer may select a contiguous date range; otherwise a
+  /// single day only.
+  allowMultiDay  Boolean @default(false)
+  /// Optional cap on the number of days a single multi-day booking may span.
+  maxBookingDays Int?
+
+  // ── Physical place assignment ───────────────────────────────────────────────
+  /// When true, reception/gate must assign a physical place to every unit
+  /// before the guest can be checked in.
+  placeAssignmentRequired Boolean   @default(false)
+  /// The kind of place this service's units map to (cabin/cabana/umbrella/…).
+  placeType               PlaceType @default(SEAT)
+  /// When true, confirming a booking of this service ALSO provisions the guest in
+  /// ZKBio CVSecurity (physical access card + door-opening QR) so they can unlock
+  /// their assigned cabin — on top of the normal resort-gate QR. Requires
+  /// `placeAssignmentRequired` (each cabin's door maps to a ServicePlace access
+  /// level). Beach/day-use services leave this false and use gate entry only.
+  requiresAccessControl   Boolean   @default(false)
+  /// Hard daily capacity in people (null = unlimited).
+  dailyCapacityPeople     Int?
+  /// Hard daily capacity in cars (null = unlimited).
+  dailyCapacityCars       Int?
+  /// Hard daily capacity in handicap people (null = unlimited).
+  dailyCapacityHandicap   Int?
+  /// Maximum people per single booking.
+  maxPeoplePerBooking     Int?
+  /// Maximum cars per single booking.
+  maxCarsPerBooking       Int?
+  /// Maximum handicap people per single booking.
+  maxHandicapPerBooking   Int?
+  /// Opening time in HH:mm format.
+  openTime                String?   @default("09:00")
+  /// Closing time in HH:mm format.
+  closeTime               String?   @default("18:00")
+  isActive                Boolean   @default(true)
+  sortOrder               Int       @default(0)
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  category   Category       @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  priceRules PriceRule[]
+  bookings   Booking[]
+  holds      BookingHold[]
+  slots      BookingSlot[]
+  places     ServicePlace[]
+  reviews    Review[]
+
+  @@unique([categoryId, slug])
+  @@index([isActive, sortOrder])
+  @@index([categoryId])
+  @@index([updatedAt])
+}
+
+/// Admin-managed inventory of physical places for a service — the cabins,
+/// cabanas, umbrellas or seats that reception/gate assign to booking units.
+/// `zone` + `position` drive the adjacency recommendation (consecutive
+/// positions within the same zone are considered "next to each other").
+model ServicePlace {
+  id              String    @id @default(cuid())
+  serviceId       String
+  /// Human label printed on the place / shown to staff, e.g. "C12", "Umbrella 3".
+  label           String
+  type            PlaceType
+  /// Optional grouping (row / section / area) used for adjacency.
+  zone            String?
+  /// Ordinal within the zone — consecutive positions are adjacent.
+  position        Int       @default(0)
+  /// Coordinates on the visual layout map (admin-arranged floor plan). Reception
+  /// & gate render places at these positions for cinema-style selection.
+  gridX           Int       @default(0)
+  gridY           Int       @default(0)
+  sortOrder       Int       @default(0)
+  isActive        Boolean   @default(true)
+  /// Accessibility (handicap) cell. Reception & gate render it in a distinct
+  /// colour + wheelchair mark so staff steer guests who need it to the right
+  /// place. Purely advisory — it does not change availability or pricing.
+  isHandicap      Boolean   @default(false)
+  /// ZKBio CVSecurity access-level group id that opens THIS specific place's door.
+  /// Set by an admin to the id of a level group pre-created & synced to the panel
+  /// in ZKBio. Only meaningful when the parent service `requiresAccessControl`.
+  /// When a booking unit is assigned this place, the guest's ZK person is bound to
+  /// this level so their card/QR opens only their assigned cabin. Null = no door.
+  zkAccessLevelId String?
+  /// Optional human label for the ZK door/level (admin display only).
+  zkDoorLabel     String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  service    Service          @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  units      BookingUnit[]
+  outages    PlaceOutage[]
+  outageLogs PlaceOutageLog[]
+  opsTickets OpsTicket[]
+
+  @@unique([serviceId, label])
+  @@index([serviceId, isActive])
+  @@index([updatedAt])
+}
+
+/**
+ * A scheduled window during which a place is OUT OF SERVICE — it cannot be
+ * booked or assigned while the window is active (maintenance, damage, private
+ * hold, etc.). Distinct from `ServicePlace.isActive`, which is an open-ended
+ * manual online/offline switch. A place is bookable on a given day only when it
+ * is online AND no outage overlaps that day.
+ */
+model PlaceOutage {
+  id          String   @id @default(cuid())
+  placeId     String
+  /// Start / end instants of the downtime (UTC).
+  startsAt    DateTime
+  endsAt      DateTime
+  /// Optional operator note shown in the admin (e.g. "deep clean", "storm damage").
+  reason      String?
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  place ServicePlace @relation(fields: [placeId], references: [id], onDelete: Cascade)
+
+  @@index([placeId])
+  @@index([startsAt, endsAt])
+}
+
+/**
+ * Append-only downtime HISTORY for a place — the reporting source of truth.
+ * `PlaceOutage` rows are LIVE state and are hard-deleted when an admin cancels
+ * a window or ends downtime early, which would erase the elapsed downtime from
+ * any report. Every out-of-service mutation therefore also writes here:
+ * - scheduling an outage creates a mirroring row (`outageId` links them);
+ * - ending an active outage early TRUNCATES `endsAt` to the actual end;
+ * - cancelling a future window sets `cancelled` (zero downtime, kept for audit);
+ * - flipping `ServicePlace.isActive` off/on opens/closes a `kind=INACTIVE`
+ * span (`endsAt` null while the place is still offline).
+ * Rows are never deleted, so "how many times / how long was this place out"
+ * stays answerable forever.
+ */
+model PlaceOutageLog {
+  id          String    @id @default(cuid())
+  placeId     String
+  /// Live PlaceOutage row this mirrors — null for INACTIVE spans, dangling after delete.
+  outageId    String?   @unique
+  /// OUTAGE = scheduled window; INACTIVE = open-ended offline (isActive=false).
+  kind        String    @default("OUTAGE")
+  startsAt    DateTime
+  /// Null = span still open (place still offline). Truncated to the real end on early termination.
+  endsAt      DateTime?
+  /// Window was cancelled before it started — counts as zero downtime.
+  cancelled   Boolean   @default(false)
+  reason      String?
+  createdById String?
+  endedById   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  place ServicePlace @relation(fields: [placeId], references: [id], onDelete: Cascade)
+
+  @@index([placeId, startsAt])
+  @@index([startsAt, endsAt])
+}
+
+model PriceRule {
+  id          String        @id @default(cuid())
+  serviceId   String
+  kind        PriceRuleKind
+  /// Per-unit price in minor units (piastres). Interpretation depends on `kind`.
+  amountCents Int
+  /// For DATE_OVERRIDE / WEEKEND_SURCHARGE — optional date range.
+  startDate   DateTime?
+  endDate     DateTime?
+  /// 0 = Sunday … 6 = Saturday. Used by WEEKEND_SURCHARGE.
+  weekdayMask Int?
+  isActive    Boolean       @default(true)
+  priority    Int           @default(0)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@index([serviceId, kind, isActive])
+  @@index([startDate, endDate])
+  @@index([updatedAt])
+}
+
+// ───── Bookings ──────────────────────────────────────────────────────────────
+
+/// DEPRECATED — UNUSED. No code path creates, consumes, or expires holds; the
+/// real design reserves NOTHING while a booking is PENDING_PAYMENT and instead
+/// re-validates capacity inside the Serializable payment-confirm transaction
+/// (the C-1 guard in src/server/payments/sync.ts), auto-refunding the unlucky
+/// second payer. Kept only to avoid a drop migration on this branch — do not
+/// build against it.
+model BookingHold {
+  id             String   @id @default(cuid())
+  bookingId      String   @unique
+  serviceId      String
+  date           DateTime
+  people         Int
+  cars           Int
+  handicapPeople Int      @default(0)
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  @@index([serviceId, date, expiresAt])
+}
+
+/// Confirmed capacity counter — written transactionally inside the webhook.
+/// Uniqueness on (serviceId, date) means only one row per service/day.
+model BookingSlot {
+  id               String   @id @default(cuid())
+  serviceId        String
+  date             DateTime
+  reservedPeople   Int      @default(0)
+  reservedCars     Int      @default(0)
+  reservedHandicap Int      @default(0)
+  updatedAt        DateTime @updatedAt
+
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@unique([serviceId, date])
+}
+
+model Booking {
+  id                     String          @id @default(cuid())
+  /// Human-readable reference, e.g. CI-20260518-AB12CD.
+  reference              String          @unique
+  userId                 String
+  serviceId              String
+  status                 BookingStatus   @default(PENDING_PAYMENT)
+  /// Booking date (no time component). For multi-day bookings this is the FIRST
+  /// day; `endDate` holds the last day (inclusive).
+  bookingDate            DateTime
+  /// Last day of a multi-day booking (inclusive). Null or equal to
+  /// `bookingDate` means a single-day booking.
+  endDate                DateTime?
+  /// Total guests on the booking (adults + children). Kept as the canonical
+  /// head-count for legacy gate/summary code; `adults` / `children` break it down.
+  people                 Int
+  /// Adult/primary persons on the booking.
+  adults                 Int             @default(1)
+  /// Children (age ≤ service.maxChildAge) on the booking.
+  children               Int             @default(0)
+  /// Optional paid "extra person" add-ons (see `Service.allowExtraPeople`).
+  /// These are billed separately at `Service.extraPersonPriceCents` and do NOT
+  /// open additional units or count toward `people` / capacity. Defaults to 0 so
+  /// legacy rows and services without the feature are unaffected.
+  extraPersons           Int             @default(0)
+  /// Number of physical booking units consumed per day (e.g. 2 cabanas).
+  unitsPerDay            Int             @default(1)
+  /// Roll-up of the unit place-assignment state — gates check-in. See enum.
+  placementStatus        PlacementStatus @default(NOT_REQUIRED)
+  cars                   Int
+  handicapPeople         Int             @default(0)
+  /// Snapshot of the locale at booking time — useful for emails/receipts.
+  locale                 String          @default("ar")
+  /// Idempotency key from the client. Same (userId, clientRequestId) returns the same row.
+  clientRequestId        String
+  /// Server timestamp set when the webhook flips status to CONFIRMED.
+  confirmedAt            DateTime?
+  cancelledAt            DateTime?
+  expiredAt              DateTime?
+  /// Gate check-in timestamp — set the FIRST time any of this booking's guests
+  /// are admitted at the gate. Non-null means at least one guest has entered.
+  checkedInAt            DateTime?
+  /// User id of the gate operator who made the first admit. Plain scalar (not a
+  /// relation) — it only ever points at a STAFF/ADMIN account for the log.
+  checkedInById          String?
+  /// Number of guests admitted so far (partial check-in by headcount). A party
+  /// may enter in groups: `checkedInCount` rises with each admit until it equals
+  /// `people`, at which point the ticket is fully used and admits no one else.
+  checkedInCount         Int             @default(0)
+  /// Gate check-OUT timestamp — set the FIRST time any of this booking's guests
+  /// are scanned out at the exit. Live on-site = checkedInCount − checkedOutCount.
+  checkedOutAt           DateTime?
+  /// User id of the gate operator who recorded the first exit (plain scalar).
+  checkedOutById         String?
+  /// Number of guests scanned out so far (partial exit by headcount). Never
+  /// exceeds `checkedInCount`; equal means the whole party has left.
+  checkedOutCount        Int             @default(0)
+  /// Reception (offline) bookings: the walk-in customer's details. The booking
+  /// itself is attributed to the staff member's `userId`; these capture the
+  /// real guest who has no website account.
+  guestName              String?
+  guestPhone             String?
+  /// User id of the reception staff who created this booking on a guest's
+  /// behalf. Non-null marks the booking as a reception/offline booking. Plain
+  /// scalar (mirrors `checkedInById`) — only ever a STAFF/ADMIN account.
+  /// For a manual-discount booking this is the AUTHORIZER (the supervisor whose
+  /// PIN approved the discount): the booking is recorded as made by them.
+  createdByStaffId       String?
+  /// Manual reception discount (supervisor PIN override): the % applied and the
+  /// staff id that authorized it. Null when there's no manual discount.
+  manualDiscountPercent  Int?
+  discountAuthorizedById String?
+  /// The reception operator physically at the desk (the logged-in staffer who
+  /// entered the booking). Recorded ALONGSIDE the authorizer on a discounted
+  /// booking so the desk staff is shown next to the supervisor. Plain scalar.
+  enteredByStaffId       String?
+
+  // ── ZKBio CVSecurity provisioning (services with requiresAccessControl) ──────
+  /// Provisioning state of this booking's physical-access credential. NONE for
+  /// non-ZK bookings; the reconciler drives PENDING → PROVISIONED/FAILED. See enum.
+  zkProvisionStatus ZkProvisionStatus @default(NONE)
+  /// Stable per-booking numeric ZK person id (`pin`). Generated once at first
+  /// provisioning; a booking-scoped person we can delete cleanly on teardown.
+  zkPin             String?
+  /// The card number currently bound to this booking's ZK person (mirrors the
+  /// claimed `ZkCard.cardNo`; kept here for display without a join). Null = none.
+  zkCardNo          String?
+  /// Last ZK provisioning error (mapped code/message), for admin troubleshooting.
+  /// Null once a provisioning attempt succeeds.
+  zkLastError       String?
+  /// Timestamp of the last successful provisioning push to ZKBio.
+  zkProvisionedAt   DateTime?
+  /// The ZK access-level ids last pushed to this booking's person, comma-joined.
+  /// Persisted so a re-sync (place reassigned/released) can DIFF against it and
+  /// actively remove revoked doors — otherwise a guest keeps access to an old
+  /// cabin after reassignment. Null = nothing pushed yet.
+  zkLevelIds        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Restrict)
+  service     Service      @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+  invoice     Invoice?
+  payments    Payment[]
+  hold        BookingHold?
+  /// Daily visit group this booking belongs to (one per customer per day).
+  /// Nullable so legacy rows work until the backfill / lazy ensure links them.
+  visitCodeId String?
+
+  gateScans           GateScanEvent[]
+  units               BookingUnit[]
+  guestIds            GuestIdDocument[]
+  opsTickets          OpsTicket[]
+  /// The physical access card claimed from the pool for this ZK booking (if any).
+  zkCard              ZkCard?
+  visitCode           VisitCode?           @relation(fields: [visitCodeId], references: [id], onDelete: SetNull)
+  /// Sanctions reserved by this booking while it awaits payment.
+  sanctionsPending    Sanction[]           @relation("SanctionPendingBooking")
+  /// Sanctions settled by this booking's successful payment.
+  sanctionsPaid       Sanction[]           @relation("SanctionPaidBooking")
+  /// The guest's post-visit review of this booking (one per booking), if left.
+  review              Review?
+  /// When the post-visit "rate your visit" nudge was sent — set once so the
+  /// daily sweep never re-nudges the same booking.
+  reviewPromptedAt    DateTime?
+  /// The customer's request to cancel this PAID booking (if any). The refund
+  /// tier is frozen at request time so a slow admin turnaround never lowers it.
+  cancellationRequest CancellationRequest?
+  /// Insurance deposit snapshot + state (if the service had insurance enabled
+  /// at commit time). Absence = not applicable. See docs/INSURANCE.md.
+  insurance           BookingInsurance?
+
+  @@unique([userId, clientRequestId])
+  @@index([visitCodeId])
+  @@index([userId, status])
+  @@index([serviceId, bookingDate, status])
+  @@index([checkedInById])
+  @@index([createdByStaffId])
+  // Report range scans (created-per-day, visits-per-day across all services).
+  @@index([createdAt])
+  @@index([bookingDate])
+  // Returning-guest lookups: walk-in history, sanctions and the desk prefill
+  // all resolve a customer by their booking's guest phone.
+  @@index([guestPhone])
+  @@index([updatedAt])
+}
+
+/// Moderation lifecycle of a guest review.
+///   PENDING  — submitted by the customer, awaiting admin moderation (default).
+///   APPROVED — visible publicly on the service page (when the master toggle is on).
+///   REJECTED — hidden from the public; the customer is told (with an optional note).
+enum ReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// A guest's post-visit star rating (1–5) + written comment for ONE booking.
+/// Created by the account customer who made the booking, after the visit has
+/// happened. Moderated by admins; approved reviews (plus a per-service average)
+/// appear publicly when `Settings.publicReviewsEnabled` is true.
+model Review {
+  id           String       @id @default(cuid())
+  /// The booking this review is tied to — exactly one review per booking.
+  bookingId    String       @unique
+  /// The customer who wrote it (same as booking.userId; kept for scoped queries).
+  userId       String
+  /// Denormalised from the booking so public per-service aggregates don't join.
+  serviceId    String
+  /// Star rating, 1 (worst) to 5 (best).
+  rating       Int          @default(5)
+  /// The customer's written comment (1–500 chars, enforced in the service).
+  comment      String
+  /// Moderation state — see enum.
+  status       ReviewStatus @default(PENDING)
+  /// Admin note: rejection reason or any internal remark.
+  adminNote    String?
+  /// Admin who last moderated (plain scalar audit FK — no relation object).
+  reviewedById String?
+  reviewedAt   DateTime?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  user    User    @relation("ReviewsGiven", fields: [userId], references: [id], onDelete: Cascade)
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  // Admin moderation queue (newest first) + public per-service listings.
+  @@index([status, createdAt])
+  @@index([serviceId, status])
+  @@index([userId])
+  @@index([updatedAt])
+}
+
+/// Lifecycle of a customer-initiated cancellation request for a PAID booking.
+///   PENDING   — submitted by the customer, awaiting admin action (default).
+///   APPROVED  — admin processed it: booking cancelled + the locked refund issued.
+///   REJECTED  — admin declined it (abuse / dispute); no refund, booking stands.
+///   WITHDRAWN — the customer cancelled the request before it was processed.
+enum CancellationRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  WITHDRAWN
+}
+
+/// A customer's request to cancel their own PAID (CONFIRMED) booking from the
+/// app. Self-cancel of a paid booking is otherwise reception-only, so this is
+/// how an account customer asks for one. The refund percentage + amount are
+/// LOCKED at `requestedAt` (computed from the tiered policy as of that moment),
+/// so a slow admin turnaround can NEVER lower what the guest is owed — a request
+/// made 7+ days out is refunded 100% even if the admin processes it 4 days out.
+model CancellationRequest {
+  id                  String                    @id @default(cuid())
+  /// The booking being cancelled — one active request per booking.
+  bookingId           String                    @unique
+  /// The requesting account customer (equals booking.userId).
+  userId              String
+  /// When the customer submitted — the moment the refund tier is frozen.
+  requestedAt         DateTime                  @default(now())
+  /// Optional free-text reason from the customer (<= 500 chars, enforced in service).
+  reason              String?
+  /// Refund tier LOCKED at request time (0–100) + the resolved amount in cents,
+  /// from `computeTieredRefund({ now: requestedAt })`. The admin refunds THIS
+  /// amount on approval, never a re-computed one.
+  lockedRefundPercent Int
+  lockedRefundCents   Int
+  /// Whole hours before the visit's first day at request time (audit + display).
+  hoursBeforeStart    Int
+  /// Invoice total the lock was computed against (audit; net of prior refunds).
+  totalCentsAtRequest Int
+  status              CancellationRequestStatus @default(PENDING)
+  /// Admin note on approve/reject (shown to the customer + kept internally).
+  adminNote           String?
+  /// Admin who processed it (plain scalar audit FK — no relation object).
+  processedById       String?
+  processedAt         DateTime?
+  createdAt           DateTime                  @default(now())
+  updatedAt           DateTime                  @updatedAt
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  user    User    @relation("CancellationRequestsMade", fields: [userId], references: [id], onDelete: Cascade)
+
+  // Admin queue (pending first, oldest first) + per-customer scoping.
+  @@index([status, requestedAt])
+  @@index([userId])
+  @@index([updatedAt])
+}
+
+/// One physical unit of a booking for one specific day. A 6-person booking in a
+/// 4-person cabana over 2 days produces 2 units/day × 2 days = 4 rows. The
+/// place (cabin/cabana/umbrella/seat) is assigned later by reception/gate.
+model BookingUnit {
+  id           String    @id @default(cuid())
+  bookingId    String
+  /// The specific day this unit covers (UTC midnight, matches BookingSlot.date).
+  date         DateTime
+  /// 0-based ordinal within the booking's units for that day.
+  unitIndex    Int       @default(0)
+  adults       Int       @default(0)
+  children     Int       @default(0)
+  /// Assigned physical place — null until reception/gate places it.
+  placeId      String?
+  /// Staff user id who assigned the place (plain scalar, like checkedInById).
+  assignedById String?
+  assignedAt   DateTime?
+  /// Per-unit check-in stamp (gate admits the unit).
+  checkedInAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  booking Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  place   ServicePlace? @relation(fields: [placeId], references: [id], onDelete: SetNull)
+
+  /// Race guard: a physical place can be held by at most one unit per day.
+  /// Postgres treats NULL `placeId` as distinct, so unassigned units never
+  /// collide on this constraint.
+  @@unique([placeId, date])
+  @@index([bookingId])
+  @@index([date])
+  @@index([updatedAt])
+}
+
+/// Identity document uploaded for one guest of a booking, collected by reception
+/// staff at check-in. Every guest (1 … `Booking.people`) must have exactly one
+/// document before the gate will admit the party — see `guestIdStatusFor` and
+/// the `guest_id_required` gate in `checkInBooking`. The row carries the full
+/// provenance the audit trail needs (who uploaded, when, file metadata).
+model GuestIdDocument {
+  id                 String               @id @default(cuid())
+  bookingId          String
+  /// 1-based guest slot this document belongs to (Guest 1 … Guest N). The unique
+  /// constraint with `bookingId` means re-uploading a guest's ID overwrites the
+  /// previous row rather than piling up duplicates.
+  guestSeq           Int
+  /// The guest's ID-card / passport NUMBER, entered by reception after uploading
+  /// the document photo. Checked against the identity blocklist (as national-id
+  /// and passport) at save + check-in, and used as the gate-picker label so staff
+  /// can pick who is entering by number + photo. Falls back to "Guest N" when
+  /// blank. (Column name kept as `guestName` for backward compatibility — it
+  /// historically held a free-text name; no migration / data change.)
+  guestName          String?
+  /// Per-guest gate entry stamp + operator. NULL = this specific guest hasn't
+  /// entered yet; the gate selects which guests are admitted by their photo.
+  checkedInAt        DateTime?
+  checkedInById      String?
+  /// Original client file name (display only — never used for storage paths).
+  fileName           String
+  /// Stored MIME type (validated server-side against an allow-list).
+  fileType           String
+  fileSizeBytes      Int
+  /// On-disk path relative to `public/` (audit/forensics; not served directly).
+  storagePath        String
+  /// Public URL the preview/admin views load.
+  imageUrl           String
+  /// Reception staff user id who uploaded the document.
+  uploadedById       String
+  verificationStatus IdVerificationStatus @default(PENDING)
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  @@unique([bookingId, guestSeq])
+  @@index([bookingId])
+  @@index([uploadedById])
+  @@index([verificationStatus])
+  /// Secure-media object authz reverse-looks-up the served URL on every image
+  /// request (see /api/secure-media) — keep it a point lookup.
+  @@index([imageUrl])
+  @@index([updatedAt])
+}
+
+// ───── Invoices & payments ───────────────────────────────────────────────────
+
+model Invoice {
+  id            String        @id @default(cuid())
+  bookingId     String        @unique
+  status        InvoiceStatus @default(DRAFT)
+  currency      String        @default("EGP")
+  subtotalCents Int
+  taxCents      Int           @default(0)
+  feeCents      Int           @default(0)
+  totalCents    Int
+  /// Locked once status moves to PAID. UI must show a banner if mutated thereafter.
+  issuedAt      DateTime?
+  paidAt        DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  booking Booking       @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+  lines   InvoiceLine[]
+  refunds RefundLine[]
+
+  @@index([updatedAt])
+}
+
+model InvoiceLine {
+  id         String @id @default(cuid())
+  invoiceId  String
+  label      String
+  quantity   Int    @default(1)
+  unitCents  Int
+  totalCents Int
+  meta       Json?
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+}
+
+model RefundLine {
+  id             String   @id @default(cuid())
+  invoiceId      String
+  amountCents    Int
+  /// SERVICE (booking money) vs INSURANCE (deposit payout) — disjoint pools;
+  /// netting/disposition and reports filter on this. See docs/INSURANCE.md §6.
+  kind           RefundKind @default(SERVICE)
+  reason         String?
+  /// Paymob refund id. Unique so duplicate refund webhooks don't double-credit.
+  paymobRefundId String?  @unique
+  createdAt      DateTime @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+  /// Sync pull window scan (changes-core: createdAt in (since, now] — RefundLine
+  /// is append-only, so createdAt is its change stamp).
+  @@index([createdAt])
+}
+
+model Payment {
+  id                  String          @id @default(cuid())
+  bookingId           String
+  provider            PaymentProvider @default(CREDIT_AGRICOLE)
+  status              PaymentStatus   @default(PENDING)
+  amountCents         Int
+  currency            String          @default("EGP")
+  /// Provider order/intention reference (the MPGS order id). The column name is
+  /// legacy (`paymob*`) but the value is provider-neutral. Unique so idempotent
+  /// retries collapse to the same row on the next call.
+  paymobOrderId       String?         @unique
+  /// Provider transaction id from the most recent event that mutated this payment
+  /// row. Legacy column name, provider-neutral value. Unique so duplicate
+  /// deliveries are idempotent.
+  paymobTransactionId String?         @unique
+  failureCode         String?
+  failureMessage      String?
+  /// Reception InstaPay bookings: public URL of the uploaded payment-proof
+  /// image. Null for cash or online payments.
+  proofUrl            String?
+  paidAt              DateTime?
+  refundedAt          DateTime?
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  @@index([bookingId, status])
+  @@index([provider])
+  /// Secure-media object authz reverse-looks-up the served URL (see
+  /// /api/secure-media) — keep it a point lookup.
+  @@index([proofUrl])
+  @@index([updatedAt])
+}
+
+/// Insurance deposit attached to one booking (docs/INSURANCE.md).
+/// ABSENCE of a row = insurance not applicable (legacy bookings, disabled
+/// services) — zero backfill by design. The row freezes the service config at
+/// commit time: later Service edits never change an existing booking's deposit.
+/// Refunded money is NOT duplicated here — Σ RefundLine(kind=INSURANCE) on the
+/// booking's invoice is the single source of refunded-insurance truth.
+model BookingInsurance {
+  id         String              @id @default(cuid())
+  bookingId  String              @unique
+  // ── frozen config snapshot ──
+  type       InsuranceChargeType
+  /// Percent used at commit (PERCENT type), else null.
+  percent    Int?
+  /// Fixed piastres used at commit (FIXED type), else null.
+  fixedCents Int?
+  /// Calculation base = calc.subtotalCents at commit: the eligible service
+  /// total BEFORE discounts. Discounts never re-shrink this (separation rule).
+  baseCents  Int
+  /// The deposit owed/collected, in piastres.
+  amountCents Int
+
+  // ── collection machine ──
+  collectionStatus InsuranceCollectionStatus @default(PENDING)
+  collectedAt      DateTime?
+  /// Payment channel that collected the deposit (CREDIT_AGRICOLE|CASH|INSTAPAY),
+  /// snapshotted at collection — drives the allowed refund method server-side.
+  paidVia          PaymentProvider?
+
+  // ── checkout decision machine ──
+  decision       InsuranceDecision @default(UNDECIDED)
+  decidedAt      DateTime?
+  /// Staff user who made the checkout decision. Plain scalar (like checkedInById).
+  decidedById    String?
+  /// MANDATORY when decision = NO_REFUND (server-enforced). Kept when an admin
+  /// later corrects the decision — the audit trail preserves it too.
+  noRefundReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  booking Booking           @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+  refunds InsuranceRefund[]
+
+  /// Checkout worklists + reconciliation scans (collected & undecided, …).
+  @@index([collectionStatus, decision])
+  /// Sync pull window scan (changes-core: updatedAt in (since, now]).
+  @@index([updatedAt])
+}
+
+/// One insurance-refund ATTEMPT (append-only workflow rows — a rejected or
+/// failed attempt is never overwritten; corrections append new rows so the
+/// full history stays queryable). At most ONE active row
+/// (AWAITING_ADMIN | PENDING_DESK | PROCESSING) may exist per BookingInsurance —
+/// enforced by an atomic decision claim in the service layer PLUS a raw-SQL
+/// partial unique index in the migration (belt and braces).
+model InsuranceRefund {
+  id                 String                @id @default(cuid())
+  bookingInsuranceId String
+  method             InsuranceRefundMethod
+  status             InsuranceRefundStatus
+  /// Frozen at decision time = refundable insurance then (collected − already
+  /// refunded). Never recomputed after creation.
+  amountCents        Int
+  /// Reception staff whose checkout decision opened this attempt (plain scalar).
+  requestedById      String
+  /// Admin who approved a PROVIDER refund (plain scalar).
+  approvedById       String?
+  /// Deterministic MPGS refund-leg transaction id (`insref-{id}-{attempt}`),
+  /// persisted BEFORE the gateway call so a crash-retry re-sends the SAME leg
+  /// and the sweep can match gateway evidence to this row. Unique.
+  providerRefundRef  String?               @unique
+  /// Gateway attempt counter. Incremented only after RETRIEVE_ORDER evidence
+  /// proves the previous leg does not exist / definitively failed.
+  attempt            Int                   @default(1)
+  /// InstaPay desk payout proof image (/api/secure-media/... URL). MANDATORY
+  /// for INSTAPAY completion; served only via the secure-media object authz.
+  proofUrl           String?
+  failureMessage     String?
+  completedAt        DateTime?
+  createdAt          DateTime              @default(now())
+  updatedAt          DateTime              @updatedAt
+
+  bookingInsurance BookingInsurance @relation(fields: [bookingInsuranceId], references: [id], onDelete: Restrict)
+
+  @@index([bookingInsuranceId])
+  /// Admin queue (AWAITING_ADMIN oldest-first) + desk worklist + sweep scans.
+  @@index([status, createdAt])
+  /// Secure-media object authz reverse lookup (point read, Payment.proofUrl precedent).
+  @@index([proofUrl])
+  /// Sync pull window scan.
+  @@index([updatedAt])
+}
+
+// ───── Audit & media ─────────────────────────────────────────────────────────
+
+model AuditLog {
+  id          String      @id @default(cuid())
+  actorUserId String?
+  action      AuditAction
+  entityType  String
+  entityId    String?
+  before      Json?
+  after       Json?
+  ipAddress   String?
+  userAgent   String?
+  createdAt   DateTime    @default(now())
+
+  actor User? @relation("AuditActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([actorUserId, createdAt])
+  @@index([action])
+}
+
+/// One row per gate scan action (admit or deny). Powers the admin "Gate
+/// activity" report: per-operator working time, admit/deny people counts, and a
+/// per-scan trail of who handled it, who was scanned, and which category they
+/// were trying to enter. Admits are also reflected in `Booking.checkedInAt`;
+/// denies live only here (the booking is never mutated by a deny).
+model GateScanEvent {
+  id            String         @id @default(cuid())
+  createdAt     DateTime       @default(now())
+  result        GateScanResult
+  /// Gate operator (STAFF / SECURITY / admin) who handled the scan.
+  operatorId    String
+  /// Booking that was scanned — null for an unknown / forged pass.
+  bookingId     String?
+  /// The guest who owns the scanned booking — null when unknown.
+  scannedUserId String?
+  /// Category the guest was trying to enter — null when unknown.
+  categoryId    String?
+  /// Party size on the booking (people). 0 when the pass couldn't be resolved.
+  people        Int            @default(0)
+  /// Booking reference / invoice shown in the trail (kept even if the booking is later removed).
+  reference     String?
+  /// Reason for a DENIED scan (e.g. "Pass was cancelled"). Null for admits.
+  /// For RECEPTION events it carries the payment method ("CASH" / "INSTAPAY").
+  reason        String?
+  /// Amount collected, in piastres — set only for RECEPTION events; null for
+  /// admits/denies. Only ever surfaced on the admin gate-activity report.
+  amountCents   Int?
+
+  operator    User      @relation("GateOperator", fields: [operatorId], references: [id], onDelete: Cascade)
+  scannedUser User?     @relation("GateScannedUser", fields: [scannedUserId], references: [id], onDelete: SetNull)
+  booking     Booking?  @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  category    Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  @@index([operatorId, createdAt])
+  @@index([result, createdAt])
+}
+
+/// Physical area a work session belongs to — set from the first action that
+/// opened it (a gate scan → GATE, a reception sale → RECEPTION). Used to label
+/// the staff working-hours report.
+enum StaffWorkLocation {
+  GATE
+  RECEPTION
+  OPS
+}
+
+/// A staff working session ("shift"), auto-opened by the first gate/reception
+/// action of a shift and refreshed on every subsequent action. The product has
+/// no explicit clock-in/out, so hours are derived from real activity: a session's
+/// worked span is `(endedAt ?? lastActivityAt) − startedAt` — never counted past
+/// the last real action, so an un-closed session can't inflate hours — and a gap
+/// longer than the idle threshold between actions opens a NEW session instead of
+/// stretching one, so long breaks are excluded from worked time. Append-only and
+/// best-effort: a failed session write never blocks the underlying booking/scan.
+model WorkSession {
+  id             String            @id @default(cuid())
+  staffId        String
+  location       StaffWorkLocation
+  startedAt      DateTime          @default(now())
+  /// Timestamp of the most recent action attributed to this session; the worked
+  /// span is measured to here while the session is open.
+  lastActivityAt DateTime          @default(now())
+  /// Set when the session is closed — explicitly (sign-out) or lazily when the
+  /// next action arrives after an idle gap. NULL = still open.
+  endedAt        DateTime?
+  /// True when closed by the idle-gap / sign-out fallback rather than an explicit
+  /// end-shift action (kept for transparency in reports).
+  autoClosed     Boolean           @default(false)
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  staff User @relation("WorkSessionStaff", fields: [staffId], references: [id], onDelete: Cascade)
+
+  @@index([staffId, startedAt])
+  @@index([staffId, endedAt])
+}
+
+model Media {
+  id           String   @id @default(cuid())
+  url          String
+  mimeType     String
+  width        Int?
+  height       Int?
+  sizeBytes    Int?
+  /// Hex SHA-256 of the stored bytes, written at upload/receive time and used by
+  /// the sync file-integrity layer to verify transfers and detect corruption.
+  /// Null on legacy rows (lazily backfilled by the GET /api/sync/file sender).
+  /// Deliberately NO updatedAt: repair decisions read LIVE disk state, never this
+  /// row (see docs/SYNC.md "File integrity").
+  sha256       String?
+  uploadedById String?
+  createdAt    DateTime @default(now())
+
+  @@index([uploadedById])
+  /// secure-media reverse-lookup + the receiver's findFirst({ where: { url } }).
+  @@index([url])
+  /// Sync pull window scan (changes-core: createdAt in (since, now] — Media is
+  /// append-only, so createdAt is its change stamp).
+  @@index([createdAt])
+}
+
+/**
+ * Singleton row holding mutable site-wide configuration. Always exactly one
+ * row, identified by `id = "default"`. Read with the server-side
+ * `getSettings()` helper (creates the row on first read), updated through the
+ * `updateSettingsAction` server action which writes an `AuditLog` entry.
+ * Fields here override env defaults where the application reads them — see
+ * `src/server/settings/settings.ts` for the resolution helpers.
+ */
+model Settings {
+  id                      String    @id @default("default")
+  /**
+   * Public-facing brand name. Falls back to NEXT_PUBLIC_APP_NAME if blank.
+   */
+  siteName                String    @default("Crown Island")
+  /**
+   * Customer-facing support contact (shown on receipts, support page).
+   */
+  supportEmail            String?
+  supportPhone            String?
+  /**
+   * Where new-booking notifications are sent. Falls back to ADMIN_BOOTSTRAP_EMAIL.
+   */
+  adminNotifyEmail        String?
+  /**
+   * Display currency code (ISO 4217). Persisted independently of basePriceCents.
+   */
+  defaultCurrency         String    @default("EGP")
+  /**
+   * Default UI locale for unauthenticated visitors.
+   */
+  defaultLocale           String    @default("ar")
+  /**
+   * Minimum hours between "now" and a booking's date. 0 = same-day allowed.
+   */
+  bookingLeadTimeHours    Int       @default(0)
+  /**
+   * How many hours before the booking date a customer can still cancel.
+   */
+  cancellationCutoffHours Int       @default(24)
+  /**
+   * How long an unpaid booking holds its slot before expiring.
+   */
+  holdTtlMinutes          Int       @default(15)
+  /**
+   * Master switch — when false, the booking flow shows a maintenance state.
+   */
+  bookingsEnabled         Boolean   @default(true)
+  /**
+   * Master switch for the public guest-review display. When false, approved
+   * reviews + average ratings are hidden on ALL customer-facing pages (they
+   * still exist in the admin "Guest Comments" section). Toggled from the admin
+   * ratings dashboard.
+   */
+  publicReviewsEnabled    Boolean   @default(true)
+  /**
+   * Developer Section: Sandbox mode bypasses real payments for TESTER users.
+   */
+  sandboxMode             Boolean   @default(false)
+  /**
+   * Homepage hero "video slot" — a single admin-controlled video that plays at
+   * the top of the booking page in place of the rotating ActivitySpotlight.
+   * When blank, the page falls back to the rotating photo spotlight.
+   */
+  heroVideoUrl            String?
+  /**
+   * Poster still shown immediately while `heroVideoUrl` buffers, then crossfaded
+   * out once the video can play. Also the static frame shown to visitors who
+   * prefer reduced motion (the video does not autoplay for them).
+   */
+  heroPosterUrl           String?
+  /**
+   * Support availability shown on the /support page. Working-day range
+   * (0 = Sunday … 6 = Saturday; wraps when open > close, e.g. Sat→Thu) and the
+   * daily open/close clock times ("HH:MM"). Drives the localized hours line and
+   * the live "available now / currently closed" status.
+   */
+  supportOpenDay          Int       @default(6)
+  supportCloseDay         Int       @default(4)
+  supportOpenTime         String    @default("09:00")
+  supportCloseTime        String    @default("23:00")
+  /**
+   * Global Terms & Conditions in English.
+   */
+  termsEn                 String?
+  /**
+   * Global Terms & Conditions in Arabic.
+   */
+  termsAr                 String?
+  /**
+   * Timestamp of when the global terms were last significantly updated.
+   */
+  termsUpdatedAt          DateTime?
+  /**
+   * Global Refund Policy in English.
+   */
+  refundPolicyEn          String?
+  /**
+   * Global Refund Policy in Arabic.
+   */
+  refundPolicyAr          String?
+  /**
+   * Timestamp of when the global refund policy was last significantly updated.
+   * Bumped by the admin mutation whenever the policy text OR the tier schedule
+   * below changes, so previously accepted users are forced to re-accept —
+   * mirrors termsUpdatedAt.
+   */
+  refundPolicyUpdatedAt   DateTime?
+  /**
+   * Structured, time-based refund SCHEDULE that the system actually enforces:
+   * a JSON array of `{ minHoursBeforeStart, refundPercent }` bands (see
+   * src/lib/refund-policy.ts). NULL → the code falls back to DEFAULT_REFUND_TIERS,
+   * so refunds work on a fresh DB. Kept alongside the free-text policy above and
+   * rendered to customers FROM this field so the shown numbers can't drift from
+   * the enforced ones.
+   */
+  refundTiers             Json?
+  /**
+   * ZKBio CVSecurity access-control integration (physical cabin door unlock).
+   * Master switch — when false the integration is inert and cabin bookings behave
+   * like normal gate-QR bookings. The API `access_token` is a SECRET and lives in
+   * the `ZK_ACCESS_TOKEN` env var only (never stored here, never sent to clients).
+   */
+  zkEnabled               Boolean   @default(false)
+  /**
+   * ZKBio server origin — scheme + host, e.g. "https://192.168.1.100". The app
+   * must be able to reach this from the server (LAN / VPN). Validated http(s).
+   */
+  zkServerUrl             String?
+  /**
+   * ZKBio server port (e.g. 8098). Combined with `zkServerUrl` into the base URL.
+   */
+  zkServerPort            Int?
+  /**
+   * Department code used for guest ZK persons (created on first use). Default "GUESTS".
+   */
+  zkGuestDeptCode         String?   @default("GUESTS")
+  updatedAt               DateTime  @updatedAt
+  updatedById             String?
+
+  @@index([updatedAt])
+}
+
+// ───── Promotions ────────────────────────────────────────────────────────────
+
+/**
+ * A staff-applied promotional code that takes a percentage off a reception
+ * (walk-in) booking total. Codes are NOT customer-facing online — reception
+ * staff enter them at the desk.
+ * Constraints enforced at redemption (see `src/server/services/promo.ts`):
+ * - `isActive` toggle + optional `startsAt`/`endsAt` validity window.
+ * - optional `maxRedemptions` global cap (race-safe conditional increment).
+ * - one redemption per customer phone (the `[promoCodeId, customerPhone]`
+ * unique on PromoRedemption), and one per booking (`bookingId` unique).
+ */
+model PromoCode {
+  id              String    @id @default(cuid())
+  /**
+   * Stored upper-cased + trimmed; matched case-insensitively at the desk.
+   */
+  code            String    @unique
+  description     String?
+  /**
+   * Whole-percent discount, 1..100.
+   */
+  percentOff      Int
+  isActive        Boolean   @default(true)
+  startsAt        DateTime?
+  endsAt          DateTime?
+  /**
+   * Global redemption cap. NULL = unlimited.
+   */
+  maxRedemptions  Int?
+  /**
+   * Running count of successful redemptions (incremented atomically).
+   */
+  redemptionCount Int       @default(0)
+  /**
+   * When true (default), each customer phone may redeem this code only once.
+   * When false, the same customer may redeem it repeatedly — still subject to the
+   * global `maxRedemptions` cap. Enforced DB-atomically for BOTH modes via the
+   * nullable `PromoRedemption.uniqueCustomerPhone` (a set phone is unique; NULLs
+   * are duplicable, so "unlimited" never collides).
+   */
+  oncePerCustomer Boolean   @default(true)
+  /**
+   * Staff user id who created the code (plain scalar audit FK, like checkedInById).
+   */
+  createdById     String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  redemptions PromoRedemption[]
+
+  @@index([isActive])
+  @@index([updatedAt])
+}
+
+/**
+ * One successful application of a PromoCode to a booking. The unique
+ * `[promoCodeId, customerPhone]` is what enforces "one per customer"
+ * atomically; `bookingId` unique enforces "one code per booking".
+ */
+model PromoRedemption {
+  id                  String   @id @default(cuid())
+  promoCodeId         String
+  /**
+   * Plain scalar (no relation) — mirrors the audit-FK convention; one per booking.
+   */
+  bookingId           String   @unique
+  /**
+   * Normalised guest phone the booking was made for. Always set (for reporting +
+   * the friendly "already used" pre-check).
+   */
+  customerPhone       String
+  /**
+   * The uniqueness key for the one-per-customer guard: set to `customerPhone`
+   * when the code is once-per-customer, NULL when it allows unlimited reuse.
+   * Postgres treats NULLs as distinct, so unlimited codes never collide while a
+   * once-per-customer code stays atomically capped at one row per phone.
+   */
+  uniqueCustomerPhone String?
+  /**
+   * Discount actually applied, in piastres.
+   */
+  discountCents       Int
+  createdAt           DateTime @default(now())
+
+  promoCode PromoCode @relation(fields: [promoCodeId], references: [id], onDelete: Cascade)
+
+  @@unique([promoCodeId, uniqueCustomerPhone])
+  @@index([promoCodeId])
+  @@index([promoCodeId, customerPhone])
+}
+
+/**
+ * Per-role ceiling on the manual reception discount a staff member may
+ * authorize with their PIN. Edited from the admin panel. One row per
+ * discount-capable role (STAFF / SUPERVISOR / MANAGER / DIRECTOR and the admin
+ * tiers). A role with no row (or 0) cannot grant a manual discount.
+ */
+model RoleDiscountLimit {
+  id          String   @id @default(cuid())
+  role        UserRole @unique
+  /// Whole-percent ceiling 0..100. DIRECTOR/admins are seeded at 100.
+  maxPercent  Int      @default(0)
+  updatedAt   DateTime @updatedAt
+  updatedById String?
+
+  @@index([updatedAt])
+}
+
+// ───── CRM tags (admin-curated library) ──────────────────────────────────────
+
+/**
+ * A reusable customer label, defined once by admins and assigned to many
+ * customers. Tags are the manual-segmentation primitive: filter the customer
+ * list by a tag to view that segment.
+ */
+model CustomerTag {
+  id          String   @id @default(cuid())
+  /**
+   * Display name, unique (case-insensitive uniqueness enforced in the service).
+   */
+  name        String   @unique
+  /**
+   * Chip tone key — one of the Badge tones: gold|navy|success|warning|danger|info|muted.
+   */
+  color       String   @default("muted")
+  /**
+   * Staff user id who created the tag (plain scalar audit FK).
+   */
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  assignments    CustomerTagAssignment[]
+  /// Notification campaigns whose audience targets this tag.
+  notifCampaigns NotificationCampaign[]
+}
+
+/**
+ * Join row: one customer ↔ one tag. Unique so a tag can't be applied twice.
+ */
+model CustomerTagAssignment {
+  id           String   @id @default(cuid())
+  userId       String
+  tagId        String
+  /**
+   * Staff user id who assigned it (plain scalar audit FK).
+   */
+  assignedById String?
+  assignedAt   DateTime @default(now())
+
+  user User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tag  CustomerTag @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, tagId])
+  @@index([tagId])
+  @@index([userId])
+}
+
+// ─── Visit codes (daily booking groups) ───────────────────────────────────────
+
+/**
+ * The DAILY ROOT CODE for a customer's visit: one row per customer identity per
+ * visit day, grouping every booking that identity made for that day. The QR /
+ * barcode shown to the guest and printed at reception encodes a token signed
+ * over `code` (never the raw ids), so ONE scan opens ALL of the day's bookings
+ * at the gate. The raw code is opaque crypto-random (unguessable, no embedded
+ * data) and is never displayed to customers.
+ * Identity rule (`identityKey`):
+ * - online bookings  → `user:<userId>`           (the account holder)
+ * - reception walk-in → `phone:<digits>`          (normalized guest phone;
+ * the booking's `userId` is the STAFF member, so it must NOT group)
+ * - walk-in w/o phone → `booking:<bookingId>`     (isolated, never merged)
+ * `visitDate` is the booking's START date (UTC midnight, exactly as
+ * `Booking.bookingDate` stores it) — multi-day bookings group under their
+ * first day and remain individually valid across their whole range.
+ */
+model VisitCode {
+  id            String    @id @default(cuid())
+  /// Opaque bearer code, e.g. "V-3K9TQ2M8WXAB". Encoded (signed) in the QR.
+  code          String    @unique
+  /// UTC midnight of the visit day (= the bookings' start date).
+  visitDate     DateTime
+  identityKey   String
+  /// Account holder for online groups (admin display / lookups). Null for walk-ins.
+  userId        String?
+  /// Walk-in guest identity captured from the first booking of the group.
+  guestName     String?
+  guestPhone    String?
+  printedAt     DateTime?
+  scanCount     Int       @default(0)
+  lastScannedAt DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  user     User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  bookings Booking[]
+
+  @@unique([identityKey, visitDate])
+  @@index([visitDate])
+  @@index([userId])
+  @@index([updatedAt])
+}
+
+/// Pool of physical ZKBio CVSecurity access cards the resort owns. An admin
+/// registers each card's number; the system claims a free card for a confirmed
+/// ZK booking, activates it for the booking's day window, and releases it (sets
+/// `assignedBookingId` null) when the booking ends, is cancelled, or expires.
+/// The claim is race-safe: `assignedBookingId` is unique, so a card backs at most
+/// one booking at a time and a conditional update (where `assignedBookingId` is
+/// null) can never double-assign.
+model ZkCard {
+  id                String    @id @default(cuid())
+  /// The card's badge number as known to ZKBio (`cardNo`). Unique across the pool.
+  cardNo            String    @unique
+  /// Optional human label (e.g. "Blue #12") shown to staff.
+  label             String?
+  /// Admin on/off switch. A retired card (false) is never newly claimed, but an
+  /// already-assigned card keeps its binding until the booking releases it.
+  isActive          Boolean   @default(true)
+  /// The booking currently holding this card, or null when free. Unique so the
+  /// atomic claim (conditional update where assignedBookingId is null) is race-safe.
+  assignedBookingId String?   @unique
+  assignedAt        DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  assignedBooking Booking? @relation(fields: [assignedBookingId], references: [id], onDelete: SetNull)
+
+  @@index([isActive, assignedBookingId])
+}
+
+// ─── Restaurants (partner profiles) ───────────────────────────────────────────
+
+/// Moderation lifecycle of a restaurant profile.
+///   PENDING  — created/edited by the owner, awaiting admin review (default).
+///   APPROVED — visible to every signed-in guest on the `/menu` directory.
+///   REJECTED — admin declined it; the owner sees `statusNote`, edits re-submit.
+///   DISABLED — admin switched an approved profile off without deleting it.
+enum RestaurantStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  DISABLED
+}
+
+/**
+ * A partner restaurant's public profile, owned and edited by a RESTAURANT-role
+ * user from `/menu/manage`, moderated by admins at `/admin/restaurants`, and
+ * browsed by guests on the `/menu` directory.
+ * One restaurant per owner (`ownerId` unique): the partner account IS the
+ * restaurant's identity here — drop the unique if multi-venue owners arrive.
+ * Security invariants (enforced in `src/server/services/restaurants.ts` and
+ * the actions that wrap it):
+ * - `ownerId` / `status` are NEVER mass-assignable from the owner form.
+ * - social/website links are stored only after strict URL-parse validation
+ * against a per-platform domain allow-list (see `src/lib/safe-url.ts`).
+ * - `coverUrl` / `menuPdfUrl` only accept `/uploads/…` paths produced by the
+ * role-gated `/api/restaurant/upload` route (random server-side filenames).
+ */
+model Restaurant {
+  id           String           @id @default(cuid())
+  ownerId      String           @unique
+  name         String
+  description  String?
+  /// App-relative `/uploads/…` cover image path from our uploader.
+  coverUrl     String?
+  /// App-relative `/uploads/…` path of the menu PDF.
+  menuPdfUrl   String?
+  /// Original client file name of the menu (display only — never a path).
+  menuPdfName  String?
+  menuPdfSize  Int?
+  /// E.164-normalised contact phone (validated with libphonenumber-js).
+  phone        String
+  facebookUrl  String?
+  instagramUrl String?
+  tiktokUrl    String?
+  websiteUrl   String?
+  address      String?
+  /// Free-form display hours, e.g. "10:00 – 23:00".
+  openingHours String?
+  status       RestaurantStatus @default(PENDING)
+  /// Admin note surfaced to the owner when the profile is rejected/disabled.
+  statusNote   String?
+  /// Admin who last moved `status` (plain scalar audit FK, like checkedInById).
+  reviewedById String?
+  reviewedAt   DateTime?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  owner User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+}
+
+// ─── Housekeeping & Maintenance (staff operations) ────────────────────────────
+
+enum OpsTicketType {
+  HOUSEKEEPING
+  MAINTENANCE
+  CLEANING
+  REPAIR
+  INSPECTION
+  OUT_OF_SERVICE
+  OTHER
+}
+
+enum OpsTicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum OpsTicketStatus {
+  NEW
+  OPEN
+  ASSIGNED
+  IN_PROGRESS
+  WAITING
+  COMPLETED
+  CANCELLED
+  REOPENED
+}
+
+enum OpsEventKind {
+  CREATED
+  ASSIGNED
+  UNASSIGNED
+  STATUS
+  PRIORITY
+  DUE_DATE
+  NOTE
+  ESCALATED
+  RETURNED_TO_SERVICE
+}
+
+/**
+ * A housekeeping / maintenance work ticket (`/gate/ops` staff operations desk).
+ * Tickets are created manually by staff or AUTO-CREATED when a place goes out
+ * of service (a `PlaceOutage` window is scheduled, or the place is switched
+ * offline) — see the hooks in `admin-places.ts`. `outageId` is a LOOSE pointer
+ * to the live `PlaceOutage` row (no FK: that row is hard-deleted when the
+ * window is cancelled or ended early) used only to de-duplicate auto-tickets.
+ * Status flow is validated in `ops-transitions.ts`; every change appends an
+ * `OpsTicketEvent` (the activity timeline) and the important ones also write
+ * the global `AuditLog`.
+ */
+model OpsTicket {
+  id              String            @id @default(cuid())
+  /// Human reference printed on the board, e.g. "OPS-20260610-4XKQ".
+  reference       String            @unique
+  type            OpsTicketType
+  priority        OpsTicketPriority @default(MEDIUM)
+  status          OpsTicketStatus   @default(NEW)
+  title           String
+  description     String?
+  /// The physical place (cell/cabana/umbrella/…) the work concerns, if any.
+  placeId         String?
+  /// Related booking, when the issue was reported against a specific stay.
+  bookingId       String?
+  createdById     String
+  assignedToId    String?
+  dueAt           DateTime?
+  /// Stamped on the first transition into IN_PROGRESS.
+  startedAt       DateTime?
+  /// Stamped on COMPLETED (cleared again on REOPENED).
+  completedAt     DateTime?
+  /// Required to complete a ticket — what was actually done.
+  resolutionNotes String?
+  /// Loose pointer to the PlaceOutage that auto-created this ticket (see above).
+  outageId        String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  place      ServicePlace? @relation(fields: [placeId], references: [id], onDelete: SetNull)
+  booking    Booking?      @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  createdBy  User          @relation("OpsTicketCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  assignedTo User?         @relation("OpsTicketAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+
+  events        OpsTicketEvent[]
+  notifications StaffNotification[]
+
+  @@index([status, priority])
+  @@index([assignedToId, status])
+  @@index([createdById])
+  @@index([placeId])
+  @@index([type, status])
+  @@index([createdAt])
+  @@index([dueAt])
+}
+
+/**
+ * Append-only activity timeline of a ticket: creation, assignment, status /
+ * priority / due-date changes, free-text progress notes (optionally with a
+ * proof photo), escalation and return-to-service. `fromValue`/`toValue` hold
+ * the old → new value for change events so the log shows exactly what moved.
+ */
+model OpsTicketEvent {
+  id        String       @id @default(cuid())
+  ticketId  String
+  kind      OpsEventKind
+  actorId   String?
+  fromValue String?
+  toValue   String?
+  note      String?
+  /// Optional uploaded photo (progress / completion proof) — a `/uploads/…` URL.
+  imageUrl  String?
+  createdAt DateTime     @default(now())
+
+  ticket OpsTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  actor  User?     @relation("OpsEventActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([ticketId, createdAt])
+  /// Secure-media object authz reverse-looks-up the served URL (see
+  /// /api/secure-media) — keep it a point lookup.
+  @@index([imageUrl])
+}
+
+/**
+ * In-app notification for a staff member (shown in the ops desk bell). Created
+ * when a place goes out of service, a ticket is created / assigned / changes
+ * status or priority, becomes overdue, is completed or reopened, or a place
+ * returns to service. One row per recipient.
+ */
+model StaffNotification {
+  id        String    @id @default(cuid())
+  userId    String
+  ticketId  String?
+  /// Machine kind: out_of_service | ticket_created | assigned | status |
+  /// priority | overdue | completed | reopened | returned_to_service.
+  kind      String
+  title     String
+  body      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user   User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ticket OpsTicket? @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
+}
+
+// ─── Customer notifications & web push ────────────────────────────────────────
+
+/// Who a broadcast notification campaign targets.
+enum NotificationAudience {
+  ALL // every active customer
+  TAG // customers carrying a chosen CustomerTag
+  SPECIFIC // a hand-picked set of customers
+}
+
+/// Lifecycle of a broadcast campaign.
+enum NotificationStatus {
+  DRAFT // saved, not yet sent
+  SCHEDULED // queued for a future scheduledAt
+  SENDING // claimed by the dispatcher (guards against double-send)
+  SENT // dispatched
+  FAILED // dispatch raised before completing
+}
+
+/**
+ * An admin-authored broadcast. Composed in /admin/notifications, dispatched
+ * either immediately or at `scheduledAt`. Dispatch fans out into one
+ * `CustomerNotification` inbox row per recipient and a web-push message to each
+ * recipient's `PushSubscription`s. Content is bilingual so the inbox + push
+ * render in the customer's own locale.
+ */
+model NotificationCampaign {
+  id             String               @id @default(cuid())
+  titleEn        String
+  titleAr        String
+  bodyEn         String
+  bodyAr         String
+  /// Optional custom image; null falls back to the site icon (/icons/icon-192.png).
+  iconUrl        String?
+  /// Optional deep-link path the notification opens, e.g. "/booking".
+  url            String?
+  audience       NotificationAudience @default(ALL)
+  /// Set when audience = TAG.
+  tagId          String?
+  status         NotificationStatus   @default(DRAFT)
+  /// Absolute instant the SCHEDULED campaign becomes due.
+  scheduledAt    DateTime?
+  sentAt         DateTime?
+  /// Delivery stats, filled in at dispatch.
+  recipientCount Int                  @default(0)
+  pushSentCount  Int                  @default(0)
+  pushFailCount  Int                  @default(0)
+  createdById    String
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  tag        CustomerTag?                    @relation(fields: [tagId], references: [id], onDelete: SetNull)
+  createdBy  User                            @relation("NotifCampaignCreator", fields: [createdById], references: [id])
+  recipients NotificationCampaignRecipient[]
+  inbox      CustomerNotification[]
+
+  @@index([status, scheduledAt])
+  @@index([createdAt])
+}
+
+/// Join row: a SPECIFIC-audience campaign ↔ a picked customer.
+model NotificationCampaignRecipient {
+  campaignId String
+  userId     String
+
+  campaign NotificationCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  user     User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([campaignId, userId])
+  @@index([userId])
+}
+
+/**
+ * Per-customer inbox row, rendered in the bell dropdown + /notifications page.
+ * Created at campaign dispatch (and reusable for future transactional events).
+ * Cascade-deleted with its campaign so an admin "remove" truly clears it from
+ * every customer's inbox.
+ */
+model CustomerNotification {
+  id         String    @id @default(cuid())
+  userId     String
+  campaignId String?
+  /// Machine kind: announcement | booking_update | reminder | promotion.
+  kind       String    @default("announcement")
+  titleEn    String
+  titleAr    String
+  bodyEn     String?
+  bodyAr     String?
+  /// Optional image sent with the notification (denormalized from the campaign
+  /// icon so the inbox + detail page are self-contained).
+  imageUrl   String?
+  url        String?
+  readAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  user     User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  campaign NotificationCampaign? @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
+}
+
+/**
+ * A Web Push subscription — one row per browser/device that granted permission.
+ * The existence of a row is the source of truth for "this device wants push";
+ * there is no separate profile flag. Dead subscriptions (HTTP 404/410 from the
+ * push service) are pruned on send.
+ */
+model PushSubscription {
+  id         String   @id @default(cuid())
+  userId     String
+  endpoint   String   @unique
+  /// Keys from the browser PushSubscription, used to encrypt the payload.
+  p256dh     String
+  auth       String
+  /// Locale captured at subscribe time so pushes render in the right language.
+  locale     String   @default("ar")
+  userAgent  String?
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ─── Offline sync layer (APP_MODE local ↔ online) ─────────────────────────────
+//
+// Two deployments of THIS codebase run the same schema, told apart by APP_MODE:
+//   - APP_MODE=online → the public server (sole writer of bookings).
+//   - APP_MODE=local  → the on-prem venue server (sole writer of operations).
+// Every synced data type has exactly one writer and one direction, so there is
+// no conflict resolution — the receiver upserts by id (idempotent). See
+// SYNC_ANALYSIS.md / SYNC_PLAN.md. These four tables are ADDITIVE: with APP_MODE
+// unset the app behaves exactly as before (nothing writes the outbox, no worker
+// runs). All ids stay cuid — cuid already gives creation-time, collision-free,
+// idempotent keys, so no primary-key migration is needed.
+
+/// The OUTBOX. On `local`, every operational write also inserts one row here in
+/// the SAME transaction (see src/server/sync/outbox.ts, a peer of the audit
+/// writer) — so a crash can never leave a mutation without its queued change,
+/// nor a queued change without its mutation. A local-only background worker
+/// drains it oldest-first, one row at a time, to online's /api/sync/apply;
+/// rows are INDEPENDENT operations, so a failing row is SKIPPED (never blocks
+/// the queue), quarantined after MAX_ATTEMPTS, periodically re-armed, and
+/// dead-lettered once the recovery budget is spent (see push.ts). Per-entity
+/// ordering is protected by the receiver's `updatedAt` version guard, not by
+/// the drain order. `online` never writes this table (passive receiver).
+model SyncQueue {
+  id         String    @id @default(cuid())
+  /// Model name of the row being pushed (allow-listed on the receiver; booking-
+  /// domain models are rejected — online is their sole writer).
+  entityType String
+  /// The cuid of the row being pushed. (entityType,entityId) identifies the
+  /// change; a whole-row snapshot rides in `payload`.
+  entityId   String
+  /// "upsert" (default) or "delete".
+  op         String    @default("upsert")
+  /// Whole-row snapshot the receiver upserts by id. Carries the row's
+  /// `updatedAt` (or a stamp for the field-scoped snapshots) so the receiver
+  /// can drop a stale out-of-order replay.
+  payload    Json
+  /// Drain order (oldest pending first). Not a strict FIFO guarantee — see the
+  /// model comment: failures are skipped and re-tried later.
+  createdAt  DateTime  @default(now())
+  /// "pending"    → not yet confirmed by online (drain picks these up);
+  /// "synced"     → 200 + confirmed body (pruned after retention);
+  /// "failed"     → quarantined after MAX_ATTEMPTS; recovery re-arms it;
+  /// "dead"       → recovery budget spent — terminal, needs manual re-arm;
+  /// "superseded" → a later `delete` for the same entity made it moot.
+  status     String    @default("pending")
+  /// Failed send attempts since the last (re-)arm; quarantined at MAX_ATTEMPTS.
+  attempts   Int       @default(0)
+  /// How many times recoverQuarantined() re-armed this row. At the cap the row
+  /// goes `dead` instead — a poison row must not churn retries forever.
+  recoveries Int       @default(0)
+  lastError  String?
+  syncedAt   DateTime?
+
+  // The drain query: WHERE status='pending' ORDER BY createdAt ASC.
+  @@index([status, createdAt])
+  @@map("sync_queue")
+}
+
+/// Small key/value store for sync bookkeeping on `local`: the online→local pull
+/// cursor (advanced using ONLINE's clock, never the device clock) and the
+/// connectivity heartbeat the booking-write lock reads. `online` does not use it.
+model SyncState {
+  /// e.g. "pull:bookings", "online:reachable".
+  key          String    @id
+  /// Opaque server-clock watermark returned by online's /api/sync/changes.
+  cursor       String?
+  lastPulledAt DateTime?
+  lastPushedAt DateTime?
+  updatedAt    DateTime  @updatedAt
+
+  @@map("sync_state")
+}
+
+/// LOCAL-owned operational state that used to live as columns on the (online-
+/// owned, pulled) Booking row. Extracted here so the pull can freely overwrite
+/// Booking without clobbering gate/ZK state, and this state pushes local→online
+/// as a pure whole-row upsert. One row per booking. `bookingId` is a plain
+/// scalar (not a relation) to keep the pull and push channels decoupled — the
+/// parent Booking always exists on both nodes in practice.
+model BookingLocalState {
+  id                String            @id @default(cuid())
+  bookingId         String            @unique
+  // ── Gate check-in / check-out (moved off Booking.checkedIn*/checkedOut*) ──
+  checkedInAt       DateTime?
+  checkedInById     String?
+  checkedInCount    Int               @default(0)
+  checkedOutAt      DateTime?
+  checkedOutById    String?
+  checkedOutCount   Int               @default(0)
+  // Roll-up of the booking's unit place-assignment (moved off Booking.placementStatus).
+  placementStatus   PlacementStatus   @default(NOT_REQUIRED)
+  // ── ZKBio provisioning (moved off Booking.zk*; hardware is on the venue LAN) ──
+  zkProvisionStatus ZkProvisionStatus @default(NONE)
+  zkPin             String?
+  zkCardNo          String?
+  zkLastError       String?
+  zkProvisionedAt   DateTime?
+  zkLevelIds        String?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  @@map("booking_local_state")
+}
+
+/// LOCAL-owned place-assignment + per-unit check-in state, moved off the
+/// (online-owned, pulled) BookingUnit row. One row per unit. Reproduces the
+/// per-day one-place race guard so a place still can't be double-booked locally.
+model UnitPlacement {
+  id            String    @id @default(cuid())
+  bookingUnitId String    @unique
+  /// Grouping/query key (plain scalar → the parent Booking).
+  bookingId     String
+  /// The unit's day (mirrors BookingUnit.date) — half of the per-day guard.
+  date          DateTime
+  /// Assigned physical place (plain scalar → ServicePlace, present on both nodes
+  /// via the catalog push). Null until reception/gate places it.
+  placeId       String?
+  assignedById  String?
+  assignedAt    DateTime?
+  /// Per-unit gate check-in stamp (moved off BookingUnit.checkedInAt).
+  checkedInAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  /// Race guard: one place per day. Postgres treats NULL placeId as distinct,
+  /// so unplaced units never collide.
+  @@unique([placeId, date])
+  @@index([bookingId])
+  @@map("unit_placement")
+}

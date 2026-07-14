@@ -1,0 +1,42 @@
+{
+  "name": "Crown Island — El Montazah",
+  "short_name": "Crown Island",
+  "description": "Premium booking experience for Crown Island — El Montazah.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#050a1a",
+  "theme_color": "#0a132a",
+  "lang": "ar",
+  "dir": "rtl",
+  "categories": ["lifestyle", "travel"],
+  "prefer_related_applications": false,
+  "related_applications": [
+    { "platform": "webapp", "url": "/manifest.webmanifest" }
+  ],
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

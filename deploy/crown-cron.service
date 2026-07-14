@@ -1,0 +1,30 @@
+# Crown Island — external cron pinger (one shot; scheduled by crown-cron.timer).
+#
+# Pokes the app's cron endpoints: scheduled-notification dispatch + MPGS payment
+# reconciliation. OPTIONAL on a single-process deployment — the app runs both
+# in-process (src/instrumentation.ts); install this as belt-and-braces or when
+# running multiple app instances with the in-process schedulers disabled
+# (NOTIF_SCHEDULER=off / PAYMENT_RECONCILER=off).
+#
+# Install (as root):
+#   1. mkdir -p /etc/crown-island
+#   2. cp deploy/cron.env.example /etc/crown-island/cron.env   # then edit it
+#   3. chmod 600 /etc/crown-island/cron.env
+#   4. cp deploy/crown-cron.service deploy/crown-cron.timer /etc/systemd/system/
+#   5. systemctl daemon-reload && systemctl enable --now crown-cron.timer
+# Verify:
+#   systemctl list-timers crown-cron.timer
+#   journalctl -u crown-cron.service -n 20
+
+[Unit]
+Description=Crown Island cron pinger (notifications + payment reconcile)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# APP_URL + CRON_SECRET live here — never in this unit file.
+EnvironmentFile=/etc/crown-island/cron.env
+ExecStart=/bin/sh -c '\
+  curl -fsS -m 30 -X POST -H "Authorization: Bearer ${CRON_SECRET}" "${APP_URL}/api/cron/notifications" || true; \
+  curl -fsS -m 60 -X POST -H "Authorization: Bearer ${CRON_SECRET}" "${APP_URL}/api/cron/reconcile-payments" || true'

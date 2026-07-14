@@ -1,0 +1,13 @@
+# Crown Island — runs crown-cron.service every minute. See crown-cron.service
+# for what it does and how to install both units.
+
+[Unit]
+Description=Run the Crown Island cron pinger every minute
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=10
+
+[Install]
+WantedBy=timers.target
